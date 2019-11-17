@@ -5,4 +5,9 @@
         <item name="android:windowFullscreen">true</item>
     </style>
 
+    <declare-styleable name="CameraButtonView">
+        <attr name="imageCaptureSize" format="dimension" />
+        <attr name="recordSize" format="dimension" />
+    </declare-styleable>
+
 </resources>

@@ -21,9 +21,9 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.camera.app.utils.CompareSizesByArea
 import com.camera.app.utils.Constants.Companion.REQUEST_CAMERA_PERMISSION
-import com.camera.app.utils.OrientationLiveData
 import com.camera.app.utils.Utils
 import com.camera.app.view.AutoFitTextureView
+import kotlinx.android.synthetic.main.activity_main.*
 import java.util.*
 import java.util.concurrent.Semaphore
 
@@ -34,14 +34,14 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var textureView: AutoFitTextureView
 
-    private lateinit var cameraId: String
-
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
 
     private lateinit var previewRequestBuilder: CaptureRequest.Builder
     private lateinit var previewRequest: CaptureRequest
     private lateinit var previewSize: Size
+
+    private var cameraId = CAMERA_BACK
 
     private var captureSession: CameraCaptureSession? = null
 
@@ -54,6 +54,7 @@ class MainActivity : AppCompatActivity() {
      * Orientation of the camera sensor
      */
     private var sensorOrientation = 0
+
 
     private val stateCallback = object : CameraDevice.StateCallback() {
 
@@ -91,6 +92,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         textureView = findViewById(R.id.textureView)
+
+        rotateView.setOnClickListener {
+            switchCamera()
+        }
+
+        captureButton.setOnClickListener {
+            captureButton.isEnabled = false
+        }
     }
 
     override fun onResume() {
@@ -114,6 +123,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun closeCamera() {
         try {
+            cameraOpenCloseLock.acquire()
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
@@ -193,7 +203,6 @@ class MainActivity : AppCompatActivity() {
                 flashSupported =
                     characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
 
-                this.cameraId = cameraId
                 return
             }
         } catch (e: CameraAccessException) {
@@ -234,6 +243,29 @@ class MainActivity : AppCompatActivity() {
         return swappedDimensions
     }
 
+
+    fun switchCamera() {
+        if (cameraId == CAMERA_FRONT) {
+            cameraId = CAMERA_BACK
+            closeCamera()
+            reOpenCamera()
+
+        } else if (cameraId == CAMERA_BACK) {
+            cameraId = CAMERA_FRONT
+            closeCamera()
+            reOpenCamera()
+        }
+    }
+
+    private fun reOpenCamera() {
+        if (textureView.isAvailable) {
+            openCamera(textureView.width, textureView.height)
+        } else {
+            textureView.surfaceTextureListener = surfaceTextureListener
+        }
+    }
+
+
     private fun openCamera(width: Int, height: Int) {
         val permission = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
         if (permission != PackageManager.PERMISSION_GRANTED) {
@@ -267,7 +299,7 @@ class MainActivity : AppCompatActivity() {
 
             // Here, we create a CameraCaptureSession for camera preview.
             cameraDevice?.createCaptureSession(
-                Arrays.asList(surface),
+                listOf(surface),
                 object : CameraCaptureSession.StateCallback() {
 
                     override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
@@ -284,6 +316,7 @@ class MainActivity : AppCompatActivity() {
                             )
                             // Flash is automatically enabled when necessary.
                             setAutoFlash(previewRequestBuilder)
+
 
                             // Finally, we start displaying the camera preview.
                             previewRequest = previewRequestBuilder.build()
@@ -365,6 +398,35 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
 
+        val CAMERA_FRONT = "1"
+        val CAMERA_BACK = "0"
+
+        /**
+         * Camera state: Showing camera preview.
+         */
+        private val STATE_PREVIEW = 0
+
+        /**
+         * Camera state: Waiting for the focus to be locked.
+         */
+        private val STATE_WAITING_LOCK = 1
+
+        /**
+         * Camera state: Waiting for the exposure to be precapture state.
+         */
+        private val STATE_WAITING_PRECAPTURE = 2
+
+        /**
+         * Camera state: Waiting for the exposure state to be something other than precapture.
+         */
+        private val STATE_WAITING_NON_PRECAPTURE = 3
+
+        /**
+         * Camera state: Picture was taken.
+         */
+        private val STATE_PICTURE_TAKEN = 4
+
+
         /**
          * Conversion from screen rotation to JPEG orientation.
          */
@@ -443,14 +505,6 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Couldn't find any suitable preview size")
                 return choices[0]
             }
-        }
-
-        /** Helper function used to convert a lens orientation enum into a human-readable string */
-        private fun lensOrientationString(value: Int) = when(value) {
-            CameraCharacteristics.LENS_FACING_BACK -> "Back"
-            CameraCharacteristics.LENS_FACING_FRONT -> "Front"
-            CameraCharacteristics.LENS_FACING_EXTERNAL -> "External"
-            else -> "Unknown"
         }
     }
 }
