@@ -7,6 +7,6 @@ class Constants {
 
     companion object {
 
-        const val REQUEST_CAMERA_PERMISSION = 1
+        const val REQUEST_CAMERA_PERMISSION = 100
     }
 }
