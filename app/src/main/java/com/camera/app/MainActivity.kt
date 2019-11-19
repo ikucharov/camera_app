@@ -1,132 +1,169 @@
 package com.camera.app
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
+import android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION
+import android.media.MediaRecorder
 import android.os.*
 import android.util.Log
+import android.util.Size
+import android.util.SparseIntArray
 import android.view.Surface
 import android.view.TextureView
-import android.view.View
+import android.widget.Button
+import android.widget.Toast
 import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
-import com.camera.app.utils.Constants.Companion.REQUEST_CAMERA_PERMISSION
+import androidx.core.app.ActivityCompat
+import com.camera.app.utils.Constants.Companion.REQUEST_VIDEO_PERMISSIONS
+import com.camera.app.utils.Constants.Companion.VIDEO_PERMISSIONS
+import com.camera.app.utils.UiUtil.chooseOptimalSize
+import com.camera.app.utils.UiUtil.chooseVideoSize
+import com.camera.app.utils.UiUtil.configureTransform
+import com.camera.app.utils.UiUtil.getVideoFilePath
 import com.camera.app.utils.gone
 import com.camera.app.utils.show
+import com.camera.app.view.AutoFitTextureView
 import kotlinx.android.synthetic.main.activity_main.*
-import pub.devrel.easypermissions.AfterPermissionGranted
-import pub.devrel.easypermissions.EasyPermissions
-import java.lang.IllegalArgumentException
+import java.io.IOException
+import java.util.*
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), ActivityCompat.OnRequestPermissionsResultCallback {
 
-    private lateinit var backgroundThread: HandlerThread
-    private lateinit var backgroundHandler: Handler
+    companion object {
+        private const val TAG = "MainActivity"
 
-    private lateinit var cameraDevice: CameraDevice
+        private const val SENSOR_ORIENTATION_DEFAULT_DEGREES = 90
+        private const val SENSOR_ORIENTATION_INVERSE_DEGREES = 270
 
-    private lateinit var captureSession: CameraCaptureSession
-    private lateinit var captureRequestBuilder: CaptureRequest.Builder
-    private var isCaptured = false
-
-    private val cameraManager: CameraManager by lazy {
-        this.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    }
-
-    private val deviceStateCallback = object : CameraDevice.StateCallback() {
-        override fun onOpened(camera: CameraDevice) {
-            if (camera != null) {
-                cameraDevice = camera
-                previewSession()
-            }
+        private val DEFAULT_ORIENTATIONS = SparseIntArray().apply {
+            append(Surface.ROTATION_0, 90)
+            append(Surface.ROTATION_90, 0)
+            append(Surface.ROTATION_180, 270)
+            append(Surface.ROTATION_270, 180)
         }
-
-        override fun onDisconnected(camera: CameraDevice) {
-            camera.close()
-        }
-
-        override fun onError(camera: CameraDevice, error: Int) {
-            this@MainActivity.finish()
-        }
-
-    }
-
-    private val surfaceListener = object : TextureView.SurfaceTextureListener {
-        override fun onSurfaceTextureSizeChanged(
-            surface: SurfaceTexture?,
-            width: Int,
-            height: Int
-        ) {
-        }
-
-        override fun onSurfaceTextureUpdated(surface: SurfaceTexture?) = Unit
-
-        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture?): Boolean = true
-
-        override fun onSurfaceTextureAvailable(surface: SurfaceTexture?, width: Int, height: Int) {
-            openCamera()
+        private val INVERSE_ORIENTATIONS = SparseIntArray().apply {
+            append(Surface.ROTATION_0, 270)
+            append(Surface.ROTATION_90, 180)
+            append(Surface.ROTATION_180, 90)
+            append(Surface.ROTATION_270, 0)
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.M)
+    private val surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+
+        @RequiresApi(Build.VERSION_CODES.M)
+        override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+            openCamera(width, height)
+        }
+
+        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+//            textureView.setTransform(
+//                configureTransform(
+//                    this@MainActivity,
+//                    width,
+//                    height,
+//                    previewSize
+//                )
+//            )
+        }
+
+        override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture) = true
+
+        override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+    }
+
+    private lateinit var textureView: AutoFitTextureView
+
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private lateinit var previewSize: Size
+
+    private lateinit var videoSize: Size
+    private var isRecordingVideo = false
+
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+
+    private val cameraOpenCloseLock = Semaphore(1)
+    private lateinit var previewRequestBuilder: CaptureRequest.Builder
+
+    /**
+     * Orientation of the camera sensor
+     */
+    private var sensorOrientation = 0
+
+
+    private val stateCallback = object : CameraDevice.StateCallback() {
+
+        override fun onOpened(cameraDevice: CameraDevice) {
+            cameraOpenCloseLock.release()
+            this@MainActivity.cameraDevice = cameraDevice
+            startPreview()
+//            textureView.setTransform(
+//                configureTransform(
+//                    this@MainActivity,
+//                    textureView.width,
+//                    textureView.height,
+//                    previewSize
+//                )
+//            )
+        }
+
+        override fun onDisconnected(cameraDevice: CameraDevice) {
+            cameraOpenCloseLock.release()
+            cameraDevice.close()
+            this@MainActivity.cameraDevice = null
+        }
+
+        override fun onError(cameraDevice: CameraDevice, error: Int) {
+            cameraOpenCloseLock.release()
+            cameraDevice.close()
+            this@MainActivity.cameraDevice = null
+        }
+    }
+
+    /**
+     * Output file for video
+     */
+    private var nextVideoAbsolutePath: String? = null
+
+    private var mediaRecorder: MediaRecorder? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        textureView = findViewById(R.id.previewTextureView)
+
+        rotateView.setOnClickListener {
+            //            switchCamera()
+        }
+
+        captureButton.setOnClickListener {
+            captureButton.isEnabled = false
+        }
+
         playVideo.setOnClickListener {
-            if (isCaptured) {
-                isCaptured = false
-                stopChronometer()
-            } else {
-                isCaptured = true
-                startChronometer()
-            }
+            if (isRecordingVideo) stopRecordingVideo() else startRecordingVideo()
         }
     }
 
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) {
-            window.decorView.systemUiVisibility = (
-                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION // hide nav bar
-                            or View.SYSTEM_UI_FLAG_FULLSCREEN // hide status bar
-                            or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        EasyPermissions.onRequestPermissionsResult(requestCode, permissions, grantResults)
-    }
-
-    @AfterPermissionGranted(REQUEST_CAMERA_PERMISSION)
-    fun checkCameraPermission() {
-        if (EasyPermissions.hasPermissions(this, Manifest.permission.CAMERA)) {
-            Log.d(TAG, "App has camera permission")
-            connectCamera()
-        } else {
-            EasyPermissions.requestPermissions(
-                this, getString(R.string.permission_request),
-                REQUEST_CAMERA_PERMISSION, Manifest.permission.CAMERA
-            )
-        }
-    }
-
+    @RequiresApi(Build.VERSION_CODES.M)
     override fun onResume() {
         super.onResume()
-
         startBackgroundThread()
-
-        if (previewTextureView.isAvailable) {
-            openCamera()
-        } else previewTextureView.surfaceTextureListener = surfaceListener
+        if (textureView.isAvailable) {
+            openCamera(textureView.width, textureView.height)
+        } else {
+            textureView.surfaceTextureListener = surfaceTextureListener
+        }
     }
 
     override fun onPause() {
@@ -135,98 +172,289 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
-    private fun openCamera() {
-        checkCameraPermission()
-    }
-
-    private fun closeCamera() {
-        if (this::captureSession.isInitialized) {
-            captureSession.close()
-        }
-        if (this::cameraDevice.isInitialized) {
-            cameraDevice.close()
-        }
-    }
-
-    private fun previewSession() {
-        val surfaceTexture = previewTextureView.surfaceTexture
-        surfaceTexture.setDefaultBufferSize(MAX_PREVIEW_WIDTH, MAX_PREVIEW_HEIGH)
-
-        val surface = Surface(surfaceTexture)
-
-        captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-        captureRequestBuilder.addTarget(surface)
-
-        cameraDevice.createCaptureSession(
-            listOf(surface),
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigureFailed(session: CameraCaptureSession) {
-                    Log.e(TAG, "creating capture session failed!!")
-                }
-
-                override fun onConfigured(session: CameraCaptureSession) {
-                    if (session != null)
-                        captureSession = session
-                    captureRequestBuilder.set(
-                        CaptureRequest.CONTROL_AF_MODE,
-                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                    )
-                    captureSession.setRepeatingRequest(captureRequestBuilder.build(), null, null)
-                }
-
-            },
-            null
-        )
-    }
-
     private fun startBackgroundThread() {
-        backgroundThread = HandlerThread("Camera 2 api").also { it.start() }
-        backgroundHandler = Handler(backgroundThread.looper)
+        backgroundThread = HandlerThread("CameraBackground")
+        backgroundThread?.start()
+        backgroundHandler = Handler(backgroundThread?.looper)
     }
 
     private fun stopBackgroundThread() {
-        backgroundThread.quitSafely()
+        backgroundThread?.quitSafely()
         try {
-            backgroundThread.join()
+            backgroundThread?.join()
+            backgroundThread = null
+            backgroundHandler = null
         } catch (e: InterruptedException) {
             Log.e(TAG, e.toString())
         }
     }
 
-    private fun <T> cameraCharacteristics(cameraId: String, key: CameraCharacteristics.Key<T>): T? {
-        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        return when (key) {
-            CameraCharacteristics.LENS_FACING -> characteristics.get(key)
-            CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP -> characteristics.get(key)
-            else -> throw IllegalArgumentException("Key not recognized")
+    /**
+     * Gets whether you should show UI with rationale for requesting permissions.
+     *
+     * @param permissions The permissions your app wants to request.
+     * @return Whether you can show permission rationale UI.
+     */
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun shouldShowRequestPermissionRationale(permissions: Array<String>) =
+        permissions.any { shouldShowRequestPermissionRationale(it) }
+
+    /**
+     * Requests permissions needed for recording video.
+     */
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun requestVideoPermissions() {
+        if (shouldShowRequestPermissionRationale(VIDEO_PERMISSIONS)) {
+//            ConfirmationDialog().show(childFragmentManager, FRAGMENT_DIALOG)
+        } else {
+            requestPermissions(VIDEO_PERMISSIONS, REQUEST_VIDEO_PERMISSIONS)
         }
     }
 
-    private fun cameraId(lens: Int): String {
-        var deviceId = listOf<String>()
-        try {
-            val cameraIdList = cameraManager.cameraIdList
-            deviceId = cameraIdList.filter {
-                lens == cameraCharacteristics(it, CameraCharacteristics.LENS_FACING)
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray
+    ) {
+        if (requestCode == REQUEST_VIDEO_PERMISSIONS) {
+            if (grantResults.size == VIDEO_PERMISSIONS.size) {
+                for (result in grantResults) {
+                    if (result != PackageManager.PERMISSION_GRANTED) {
+                        showToast(getString(R.string.permission_request))
+                        break
+                    }
+                }
+            } else {
+                showToast(getString(R.string.permission_request))
             }
-        } catch (e: CameraAccessException) {
-            Log.e(TAG, e.toString())
+        } else {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         }
-        return deviceId[0]
     }
 
+    @RequiresApi(Build.VERSION_CODES.M)
+    private fun hasPermissionsGranted(permissions: Array<String>) =
+        permissions.none {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
+
+    /**
+     * Tries to open a [CameraDevice]. The result is listened by [stateCallback].
+     *
+     * Lint suppression - permission is checked in [hasPermissionsGranted]
+     */
+    @RequiresApi(Build.VERSION_CODES.M)
     @SuppressLint("MissingPermission")
-    private fun connectCamera() {
-        val deviceId = cameraId(CameraCharacteristics.LENS_FACING_BACK)
-        Log.d(TAG, "deviceId: $deviceId")
+    private fun openCamera(width: Int, height: Int) {
+        if (!hasPermissionsGranted(VIDEO_PERMISSIONS)) {
+            requestVideoPermissions()
+            return
+        }
+
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                throw RuntimeException("Time out waiting to lock camera opening.")
+            }
+            val cameraId = manager.cameraIdList[0]
+
+            val characteristics = manager.getCameraCharacteristics(cameraId)
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?: throw RuntimeException("Cannot get available preview/video sizes")
+
+            sensorOrientation = characteristics.get(SENSOR_ORIENTATION)!!
+
+            videoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder::class.java))
+            previewSize = chooseOptimalSize(
+                map.getOutputSizes(SurfaceTexture::class.java),
+                width, height, videoSize
+            )
+
+            if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
+                textureView.setAspectRatio(previewSize.width, previewSize.height)
+            } else {
+                textureView.setAspectRatio(previewSize.height, previewSize.width)
+            }
+//            textureView.setTransform(configureTransform(this, width, height, previewSize))
+            mediaRecorder = MediaRecorder()
+            manager.openCamera(cameraId, stateCallback, null)
+        } catch (e: CameraAccessException) {
+            showToast("Cannot access the camera.")
+            finish()
+        } catch (e: NullPointerException) {
+            showToast(getString(R.string.camera_error))
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera opening.")
+        }
+    }
+
+    private fun closeCamera() {
+        try {
+            cameraOpenCloseLock.acquire()
+            closePreviewSession()
+            cameraDevice?.close()
+            cameraDevice = null
+            mediaRecorder?.release()
+            mediaRecorder = null
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera closing.", e)
+        } finally {
+            cameraOpenCloseLock.release()
+        }
+    }
+
+    private fun startPreview() {
+        if (cameraDevice == null || !textureView.isAvailable) return
 
         try {
-            cameraManager.openCamera(deviceId, deviceStateCallback, backgroundHandler)
+            closePreviewSession()
+            val texture = textureView.surfaceTexture
+            texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            previewRequestBuilder =
+                cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+
+            val previewSurface = Surface(texture)
+            previewRequestBuilder.addTarget(previewSurface)
+
+            cameraDevice?.createCaptureSession(
+                listOf(previewSurface),
+                object : CameraCaptureSession.StateCallback() {
+
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        captureSession = session
+                        updatePreview()
+                    }
+
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        showToast("Failed")
+                    }
+                }, backgroundHandler
+            )
         } catch (e: CameraAccessException) {
             Log.e(TAG, e.toString())
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Open camera device interrupted opened")
         }
+
+    }
+
+    /**
+     * Update the camera preview. [startPreview] needs to be called in advance.
+     */
+    private fun updatePreview() {
+        if (cameraDevice == null) return
+
+        try {
+            setUpCaptureRequestBuilder(previewRequestBuilder)
+            HandlerThread("CameraPreview").start()
+            captureSession?.setRepeatingRequest(
+                previewRequestBuilder.build(),
+                null, backgroundHandler
+            )
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, e.toString())
+        }
+
+    }
+
+    private fun setUpCaptureRequestBuilder(builder: CaptureRequest.Builder?) {
+        builder?.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+    }
+
+    @Throws(IOException::class)
+    private fun setUpMediaRecorder() {
+        if (nextVideoAbsolutePath.isNullOrEmpty()) {
+            nextVideoAbsolutePath = getVideoFilePath(this)
+        }
+
+        val rotation = windowManager.defaultDisplay.rotation
+        when (sensorOrientation) {
+            SENSOR_ORIENTATION_DEFAULT_DEGREES ->
+                mediaRecorder?.setOrientationHint(DEFAULT_ORIENTATIONS.get(rotation))
+            SENSOR_ORIENTATION_INVERSE_DEGREES ->
+                mediaRecorder?.setOrientationHint(INVERSE_ORIENTATIONS.get(rotation))
+        }
+
+        mediaRecorder?.apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setOutputFile(nextVideoAbsolutePath)
+            setVideoEncodingBitRate(10000000)
+            setVideoFrameRate(30)
+            setVideoSize(videoSize.width, videoSize.height)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            prepare()
+        }
+    }
+
+    private fun startRecordingVideo() {
+        if (cameraDevice == null || !textureView.isAvailable) return
+
+        try {
+            closePreviewSession()
+            setUpMediaRecorder()
+            val texture = textureView.surfaceTexture.apply {
+                setDefaultBufferSize(previewSize.width, previewSize.height)
+            }
+
+            // Set up Surface for camera preview and MediaRecorder
+            val previewSurface = Surface(texture)
+            val recorderSurface = mediaRecorder!!.surface
+            val surfaces = ArrayList<Surface>().apply {
+                add(previewSurface)
+                add(recorderSurface)
+            }
+            previewRequestBuilder =
+                cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    addTarget(previewSurface)
+                    addTarget(recorderSurface)
+                }
+
+            // Start a capture session
+            // Once the session starts, we can update the UI and start recording
+            cameraDevice?.createCaptureSession(
+                surfaces,
+                object : CameraCaptureSession.StateCallback() {
+
+                    override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
+                        captureSession = cameraCaptureSession
+                        updatePreview()
+                        runOnUiThread {
+                            stopChronometer()
+                            isRecordingVideo = true
+                            mediaRecorder?.start()
+                        }
+                    }
+
+                    override fun onConfigureFailed(cameraCaptureSession: CameraCaptureSession) {
+                        showToast("Failed")
+                    }
+                }, backgroundHandler
+            )
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, e.toString())
+        } catch (e: IOException) {
+            Log.e(TAG, e.toString())
+        }
+
+    }
+
+    private fun closePreviewSession() {
+        captureSession?.close()
+        captureSession = null
+    }
+
+    private fun stopRecordingVideo() {
+        isRecordingVideo = false
+        startChronometer()
+        mediaRecorder?.apply {
+            stop()
+            reset()
+        }
+
+        showToast("Video saved: $nextVideoAbsolutePath")
+        nextVideoAbsolutePath = null
+        startPreview()
     }
 
     @RequiresApi(Build.VERSION_CODES.M)
@@ -246,9 +474,6 @@ class MainActivity : AppCompatActivity() {
         chronometer.gone()
     }
 
-    companion object {
-        const val TAG = "MainActivity"
-        const val MAX_PREVIEW_WIDTH = 1024
-        const val MAX_PREVIEW_HEIGH = 1024
-    }
+    private fun showToast(message: String) =
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 }

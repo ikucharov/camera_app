@@ -1,5 +1,7 @@
 package com.camera.app.utils
 
+import android.Manifest
+
 /**
  * Utility class for constants
  */
@@ -7,6 +9,7 @@ class Constants {
 
     companion object {
 
-        const val REQUEST_CAMERA_PERMISSION = 100
+        val REQUEST_VIDEO_PERMISSIONS = 1
+        val VIDEO_PERMISSIONS = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
     }
 }
