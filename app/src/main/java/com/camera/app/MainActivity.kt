@@ -420,7 +420,7 @@ class MainActivity : AppCompatActivity(), ActivityCompat.OnRequestPermissionsRes
                         captureSession = cameraCaptureSession
                         updatePreview()
                         runOnUiThread {
-                            stopChronometer()
+                            startChronometer()
                             isRecordingVideo = true
                             mediaRecorder?.start()
                         }
@@ -446,7 +446,7 @@ class MainActivity : AppCompatActivity(), ActivityCompat.OnRequestPermissionsRes
 
     private fun stopRecordingVideo() {
         isRecordingVideo = false
-        startChronometer()
+        stopChronometer()
         mediaRecorder?.apply {
             stop()
             reset()
